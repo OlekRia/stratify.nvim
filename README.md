@@ -68,6 +68,19 @@ require("neo-tree").setup({
 })
 ```
 
+### Check that it took
+
+Getting the placement wrong produces no error — the tree simply stays
+alphabetical, which looks exactly like the problem you installed this to fix.
+
+```
+:checkhealth stratify
+```
+
+It reports whether neo-tree is holding stratify's comparison, and whether that
+comparison survives neo-tree's own validity probe — a `sort_function` that
+throws is dropped for the alphabet without a word to the user.
+
 Optional: drop the caches after a checkout or rebase.
 
 ```lua
