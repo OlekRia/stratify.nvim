@@ -13,10 +13,26 @@
 
 local M = {}
 
---- Cached per directory, keyed on the module file's mtime: the tree redraws on
---- every keystroke in filter mode, and re-reading a `mod.rs` each time would be
---- felt.
----@type table<string, { mtime: integer, ranks: table<string, integer> }>
+--- The event loop's cached time, which does NOT move while a single sort runs,
+--- however many comparisons that sort makes.
+---
+--- Two different questions are being asked of the filesystem here and they
+--- deserve different answers. "Has this file changed?" is answered by an mtime.
+--- "Is it worth asking?" is answered by this: a comparison function is called
+--- O(n log n) times per redraw, so anything done per comparison is done a
+--- hundred times for one screenful. Gating the work on the tick collapses that
+--- to once per redraw, which is the rate at which the answer can actually
+--- differ.
+---@return integer
+local function tick()
+  return vim.uv.now()
+end
+
+--- Cached per directory, keyed on the module file's path and mtime: the tree
+--- redraws on every keystroke in filter mode, and re-reading a `mod.rs` each
+--- time would be felt. `ranks` is nil for a directory with no module list,
+--- which most directories are and all of which used to re-ask.
+---@type table<string, { path: string?, mtime: integer, checked: integer, ranks: table<string, integer>? }>
 local cache = {}
 
 --- The module name this line declares, if it declares one.
@@ -36,19 +52,42 @@ end
 ---@param dir string
 ---@return table<string, integer>?
 local function ranks_for(dir)
-  local path = dir .. "/mod.rs"
-  local stat = vim.uv.fs_stat(path)
-  if not stat then
-    path = dir .. "/lib.rs"
-    stat = vim.uv.fs_stat(path)
-  end
-  if not stat then
-    cache[dir] = nil
-    return nil
+  local hit = cache[dir]
+  if hit and hit.checked == tick() then
+    return hit.ranks
   end
 
-  local hit = cache[dir]
-  if hit and hit.mtime == stat.mtime.sec then
+  -- `main.rs` is a crate root exactly as much as `lib.rs` is, and a binary is
+  -- where a stratified layout shows itself most — the top of the program is
+  -- the one place the whole stack is named in order. Leaving it out sorted
+  -- every `src/` of every binary crate alphabetically.
+  local path, stat
+  for _, root in ipairs({ "/mod.rs", "/lib.rs", "/main.rs" }) do
+    path = dir .. root
+    stat = vim.uv.fs_stat(path)
+    if stat then
+      break
+    end
+  end
+
+  local function remember(ranks)
+    cache[dir] = {
+      path = stat and path or nil,
+      mtime = stat and stat.mtime.sec or 0,
+      checked = tick(),
+      ranks = ranks,
+    }
+    return ranks
+  end
+
+  if not stat then
+    return remember(nil)
+  end
+  -- The path is compared as well as the mtime because a directory can change
+  -- WHICH root it has — a `mod.rs` added beside a `lib.rs` — and two files are
+  -- perfectly free to share a timestamp.
+  if hit and hit.path == path and hit.mtime == stat.mtime.sec then
+    hit.checked = tick()
     return hit.ranks
   end
 
@@ -68,12 +107,9 @@ local function ranks_for(dir)
     end
   end)
   if not ok or next_rank == 1 then
-    cache[dir] = nil
-    return nil
+    return remember(nil)
   end
-
-  cache[dir] = { mtime = stat.mtime.sec, ranks = ranks }
-  return ranks
+  return remember(ranks)
 end
 
 --- Cached per manifest, keyed on its mtime, like the module lists.
@@ -148,27 +184,46 @@ local function member_ranks(manifest)
   return ranks
 end
 
+--- The answer `workspace_ranks` gave this directory on the current tick.
+---
+--- The walk itself is what is remembered, not just its result: finding the
+--- manifest costs a stat per level and a directory eight deep pays it every
+--- time two of its children are compared, which is most of the cost of a
+--- lookup that usually ends in "no".
+---@type table<string, { checked: integer, ranks: table<string, integer>? }>
+local ws_lookup = {}
+
 --- The nearest `Cargo.toml` at or above this directory that declares members.
 ---@param dir string
 ---@return table<string, integer>?
 local function workspace_ranks(dir)
+  local hit = ws_lookup[dir]
+  if hit and hit.checked == tick() then
+    return hit.ranks
+  end
+
+  local ranks
   local at = dir
   for _ = 1, 32 do
-    local ranks = member_ranks(at .. "/Cargo.toml")
+    ranks = member_ranks(at .. "/Cargo.toml")
     if ranks then
-      return ranks
+      break
     end
     local up = vim.fs.dirname(at)
     if up == at or up == "" then
-      return nil
+      break
     end
     at = up
   end
-  return nil
+
+  ws_lookup[dir] = { checked = tick(), ranks = ranks }
+  return ranks
 end
 
---- Cached per directory of crates, keyed on the newest manifest mtime.
----@type table<string, { mtime: integer, ranks: table<string, integer> }>
+--- Cached per directory of crates, keyed on the newest manifest mtime, and
+--- revalidated at most once per tick. `ranks` is nil for a directory that holds
+--- no crates, which is a real answer worth keeping.
+---@type table<string, { mtime: integer, checked: integer, ranks: table<string, integer>? }>
 local crate_cache = {}
 
 --- A crate manifest's package name and the packages it depends on.
@@ -222,34 +277,67 @@ end
 ---@param dir string
 ---@return table<string, integer>?
 local function crate_ranks(dir)
-  local names, deps_of, newest = {}, {}, 0
-  local children = {}
+  local hit = crate_cache[dir]
+  if hit and hit.checked == tick() then
+    return hit.ranks
+  end
+
+  -- Cheap pass. Which children carry a manifest, and when was the newest of
+  -- them touched — no manifest is READ here. "Has anything changed" is a stat,
+  -- and on a folder of thirty crates that is the difference between thirty
+  -- stats and thirty whole files, once per redraw instead of once per
+  -- comparison.
+  local children, newest = {}, 0
   local ok = pcall(function()
     for name, kind in vim.fs.dir(dir) do
       if kind == "directory" then
-        local manifest = dir .. "/" .. name .. "/Cargo.toml"
-        local stat = vim.uv.fs_stat(manifest)
+        local stat = vim.uv.fs_stat(dir .. "/" .. name .. "/Cargo.toml")
         if stat then
-          local pkg, deps = package_and_deps(manifest)
-          if pkg then
-            table.insert(children, name)
-            names[pkg] = name
-            deps_of[name] = deps
-            newest = math.max(newest, stat.mtime.sec)
-          end
+          table.insert(children, name)
+          newest = math.max(newest, stat.mtime.sec)
         end
       end
     end
   end)
-  if not ok or #children < 2 then
+  if not ok then
+    crate_cache[dir] = nil
     return nil
   end
 
-  local hit = crate_cache[dir]
+  -- A "no" is remembered like any other answer. Every ordinary source
+  -- directory falls all the way through to here, so leaving the negative
+  -- uncached would rescan the whole tree on each comparison to learn nothing,
+  -- which is the same waste in a cheaper suit.
+  local function remember(ranks)
+    crate_cache[dir] = { mtime = newest, checked = tick(), ranks = ranks }
+    return ranks
+  end
+
+  if #children < 2 then
+    return remember(nil)
+  end
   if hit and hit.mtime == newest then
+    hit.checked = tick()
     return hit.ranks
   end
+
+  -- Expensive pass, reached only when something under this directory actually
+  -- moved.
   table.sort(children)
+  local names, deps_of, crates = {}, {}, {}
+  for _, child in ipairs(children) do
+    local pkg, deps = package_and_deps(dir .. "/" .. child .. "/Cargo.toml")
+    -- A manifest with no `[package] name` is a virtual workspace, not a crate.
+    if pkg then
+      table.insert(crates, child)
+      names[pkg] = child
+      deps_of[child] = deps
+    end
+  end
+  if #crates < 2 then
+    return remember(nil)
+  end
+  children = crates
 
   -- Place, repeatedly, the first crate whose dependencies are all placed.
   -- A cycle would stall this, so anything still unplaced is appended in its
@@ -287,8 +375,7 @@ local function crate_ranks(dir)
     end
   end
 
-  crate_cache[dir] = { mtime = newest, ranks = ranks }
-  return ranks
+  return remember(ranks)
 end
 
 --- What a `mod X;` would call this node: a directory by its name, a file by its
@@ -372,6 +459,7 @@ end
 function M.forget()
   cache = {}
   ws_cache = {}
+  ws_lookup = {}
   crate_cache = {}
 end
 

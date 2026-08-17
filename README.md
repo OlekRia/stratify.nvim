@@ -79,9 +79,25 @@ end, { desc = "Stratify: re-read module order" })
 
 ## Cost
 
-Every lookup is cached per directory against the file's mtime. The tree
-re-sorts on each keystroke in filter mode, so re-reading a `mod.rs` each time
-would be felt; reading it once per change is not.
+A comparison function is called O(n log n) times per redraw, and the tree
+re-sorts on every keystroke in filter mode. So there are two questions, not
+one, and they get different answers: *has this file changed* is an mtime, and
+*is it worth asking* is the event loop's clock, which does not move while a
+single sort runs. Work is therefore done once per **redraw**, not once per
+comparison — including the answer "there is nothing here to order", which is
+what most directories in most trees have to say.
+
+For a folder of thirty crates, ten redraws:
+
+| | manifests read | stats |
+|---|---|---|
+| before | 36,601 | 41,480 |
+| after | 31 | 35 |
+
+A file edited mid-sort is picked up on the next redraw rather than the current
+one — which is also what keeps a sort self-consistent, since a comparator that
+changes its mind halfway through is how `table.sort` raises *invalid order
+function*.
 
 Parsing is line-based on purpose. `mod X;` sits at column zero and is one
 pattern deep; anything cleverer would need a parser to answer a question that
